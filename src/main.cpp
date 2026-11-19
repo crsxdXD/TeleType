@@ -40,6 +40,7 @@ NOTIFYICONDATAW tray{};
 std::wstring typed;
 std::wstring suggestion;
 std::wstring sourceForFix;
+std::wstring queuedFix;
 std::wstring modelName;
 std::atomic_bool requestBusy{false};
 unsigned long long version = 0;
@@ -106,6 +107,7 @@ void hidePopup() {
 }
 void clearTracked() {
     typed.clear();
+    queuedFix.clear();
     ++version;
     KillTimer(mainWindow, TIMER_SUGGEST);
     hidePopup();
@@ -185,20 +187,31 @@ void typeText(const std::wstring& value) {
     settingText = false;
 }
 std::wstring readSelectedDraft() {
-    // Preserve all clipboard formats through the Windows OLE clipboard interface.
+    // Preserve existing clipboard formats using OLE. An initially EMPTY
+    // clipboard is also valid; the old implementation rejected it outright.
     IDataObject* original = nullptr;
     const HRESULT saved = OleGetClipboard(&original);
-    // If we cannot preserve the clipboard, never overwrite it.
-    if (FAILED(saved) || !original) return {};
+    bool wasEmpty = false;
+    if (FAILED(saved) || !original) {
+        if (original) { original->Release(); original = nullptr; }
+        if (!OpenClipboard(mainWindow)) return {};
+        wasEmpty = (EnumClipboardFormats(0) == 0);
+        CloseClipboard();
+        if (!wasEmpty) return {}; // Clipboard has data we cannot safely preserve.
+    }
     const DWORD before = GetClipboardSequenceNumber();
     shortcut('A');
     shortcut('C');
-    Sleep(150);  // Telegram processes SendInput asynchronously.
     std::wstring content;
-    // Reject stale clipboard data if Telegram did not copy the selected draft.
-    const bool changed = (GetClipboardSequenceNumber() != before);
+    // Telegram processes synthetic keys asynchronously. Wait for a *new*
+    // clipboard sequence to avoid reading a previously copied private item.
+    bool changed = false;
+    for (int attempt = 0; attempt < 45; ++attempt) {
+        if (GetClipboardSequenceNumber() != before) { changed = true; break; }
+        Sleep(15);
+    }
     if (changed) {
-        for (int attempt = 0; attempt < 12; ++attempt) {
+        for (int attempt = 0; attempt < 15; ++attempt) {
             if (OpenClipboard(mainWindow)) {
                 HANDLE h = GetClipboardData(CF_UNICODETEXT);
                 if (h) {
@@ -211,10 +224,13 @@ std::wstring readSelectedDraft() {
             Sleep(15);
         }
     }
-    // Restore every clipboard format, including images and application data.
-    OleSetClipboard(original);
-    original->Release();
-    // Clear select-all without touching the draft.
+    // Restore previous clipboard data (or its initial empty state).
+    if (original) { OleSetClipboard(original); original->Release(); }
+    else if (wasEmpty && OpenClipboard(mainWindow)) {
+        EmptyClipboard();
+        CloseClipboard();
+    }
+    // Deselect all without sending Enter or modifying the message.
     keyEvent(VK_RIGHT, false); keyEvent(VK_RIGHT, true);
     return content;
 }
@@ -228,7 +244,7 @@ std::wstring localCompletion(const std::wstring& input, bool fix, std::wstring& 
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) { error = L"Cannot initialize local HTTP"; return {}; }
     // A fast connection check, but allow a small CPU model time to answer.
-    WinHttpSetTimeouts(session, 2500, 1500, 10000, fix ? 45000 : 25000);
+    WinHttpSetTimeouts(session, 2000, 1200, 5000, fix ? 30000 : 10000);
     HINTERNET connection = WinHttpConnect(session, L"127.0.0.1", 11434, 0);
     HINTERNET request = connection ? WinHttpOpenRequest(connection, L"POST", L"/api/chat",
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : nullptr;
@@ -243,18 +259,23 @@ std::wstring localCompletion(const std::wstring& input, bool fix, std::wstring& 
         ? L"You proofread an unsent chat message. Correct spelling, grammar and punctuation ONLY. "
           L"Keep the same language (Russian, Ukrainian or English), meaning, style, slang and emoji. "
           L"Never translate, expand or censor. Output only the FULL corrected text."
-        : L"You are inline autocomplete for an unsent Telegram chat message. Write ONLY the "
-          L"next natural 2-10 words, continuing the text exactly where it ends. Output only a "
-          L"SUFFIX, never repeat the original text. Keep the same language (Russian, Ukrainian "
-          L"or English), tone, slang and emoji. Use a leading space if needed. No quotes, "
-          L"markdown, explanation, or newline.";
+        : L"You are an autocomplete engine, not a chatbot. Continue the exact unfinished "
+          L"Telegram draft, never answer the speaker and never change the subject. Return "
+          L"only 2-6 next natural words as a SUFFIX, not a new message. Preserve the user's "
+          L"Russian, Ukrainian or English, grammar, tone, slang and emoji. Do not repeat "
+          L"any of the original draft. Begin with a space where appropriate. No labels, "
+          L"explanations, markdown or newlines. Example: Draft 'Я сегодня хотел бы' "
+          L"has suffix ' с тобой поговорить.' Example: Draft 'I was hoping to' "
+          L"has suffix ' see you tomorrow.'";
     const std::string body =
         "{\"model\":\"" + tinyjson::escape(utf8(modelName)) +
         "\",\"stream\":false,\"think\":false,\"keep_alive\":\"10m\",\"messages\":[" +
         "{\"role\":\"system\",\"content\":\"" + tinyjson::escape(utf8(instruction)) + "\"}," +
-        "{\"role\":\"user\",\"content\":\"" + tinyjson::escape(utf8(input)) + "\"}]" +
-        ",\"options\":{\"temperature\":" + (fix ? "0.1" : "0.45") +
-        ",\"num_ctx\":1024,\"num_predict\":" + (fix ? "512" : "64") + "}}";
+        "{\"role\":\"user\",\"content\":\"" + tinyjson::escape(utf8(
+            fix ? input : (L"Unfinished draft (extend this, do not reply): " + input))) + "\"}]" +
+        ",\"options\":{\"temperature\":" + (fix ? "0.1" : "0.2") +
+        ",\"num_ctx\":" + (fix ? "1024" : "512") +
+        ",\"num_predict\":" + (fix ? "384" : "24") + "}}";
     bool ok = false;
     DWORD status = 0;
     std::string response;
@@ -311,7 +332,7 @@ void startRequest(bool fix, const std::wstring& source) {
     }).detach();
 }
 void triggerFix() {
-    if (paused || !isTelegramForeground() || requestBusy.load()) return;
+    if (paused || !isTelegramForeground()) return;
     hidePopup();
     std::wstring full = readSelectedDraft();
     // Keep local inference responsive and avoid accidentally processing huge drafts.
@@ -323,7 +344,8 @@ void triggerFix() {
     typed = full.substr(full.size() > 600 ? full.size() - 600 : 0);
     ++version;
     sourceForFix = full;
-    startRequest(true, full);
+    if (requestBusy.load()) queuedFix = full;  // Run immediately after an ongoing completion.
+    else startRequest(true, full);
 }
 void acceptSuggestion() {
     if (suggestion.empty() || popupError || paused || !isTelegramForeground()) return;
@@ -476,6 +498,14 @@ LRESULT CALLBACK mainProc(HWND window, UINT message, WPARAM w, LPARAM l) {
         case WM_DONE: {
             std::unique_ptr<ApiResult> result(reinterpret_cast<ApiResult*>(l));
             requestBusy = false;
+            if (!queuedFix.empty()) {
+                std::wstring pending = queuedFix;
+                queuedFix.clear();
+                // Discard the outdated completion and prioritize the fix hotkey.
+                if (!paused && isTelegramForeground() && sourceForFix == pending)
+                    startRequest(true, pending);
+                return 0;
+            }
             if (result->requestedVersion != version || paused || !isTelegramForeground()) return 0;
             if (!result->error.empty()) {
                 showPopup(result->error, false, true);
