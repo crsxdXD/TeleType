@@ -1,0 +1,33 @@
+name: Build TeleType for Windows
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test JSON response handling
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror tests/json_tests.cpp -o json_tests && ./json_tests
+          g++ -std=c++17 -Wall -Wextra -Werror tests/hotkey_tests.cpp -o hotkey_tests && ./hotkey_tests
+  windows:
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Upload portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: TeleType-Windows-x64
+          path: build/Release/TeleType.exe
+          if-no-files-found: error
